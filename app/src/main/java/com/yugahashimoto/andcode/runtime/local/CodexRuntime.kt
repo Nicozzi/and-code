@@ -407,7 +407,18 @@ class CodexRuntime(
         attachments: List<PromptAttachment> = emptyList(),
     ) {
         val params = codexTurnStartParams(sessionId, prompt, model, effort, serviceTier, attachments)
-        runCatching { call("turn/start", params) }
+        runCatching {
+            val client = ensureServer()
+            try {
+                client.call("turn/start", params)
+            } catch (error: CodexJsonRpcClient.RpcError) {
+                // A saved thread may not be loaded in a newly started app-server.
+                // Retry only an explicit missing-thread rejection, never an ambiguous transport failure.
+                if (error.message?.contains("thread not found", ignoreCase = true) != true) throw error
+                client.call("thread/resume", buildJsonObject { put("threadId", JsonPrimitive(sessionId)) })
+                client.call("turn/start", params)
+            }
+        }
             .onSuccess { result ->
                 // Recorded by turn id, not just session id, so onServerEnded can evict exactly this
                 // turn's in-progress assistant message from CodexItemParser if the process dies
