@@ -65,6 +65,44 @@ class CodexRuntime(
     private val itemParser = CodexItemParser()
     private val messageStore = ClaudeMessageStore(File(runtimeDirectory, "codex-messages.json"), json)
     private val serverLock = Mutex()
+    private val threadResumeLock = Mutex()
+    private var resumedClient: CodexJsonRpcClient? = null
+    private val resumedThreads = mutableSetOf<String>()
+
+    private fun selectResumeClient(client: CodexJsonRpcClient) {
+        if (resumedClient !== client) {
+            resumedClient = client
+            resumedThreads.clear()
+        }
+    }
+
+    private suspend fun markThreadLoaded(client: CodexJsonRpcClient, sessionId: String) {
+        threadResumeLock.withLock {
+            selectResumeClient(client)
+            resumedThreads.add(sessionId)
+        }
+    }
+
+    private suspend fun ensureThreadLoaded(
+        client: CodexJsonRpcClient,
+        sessionId: String,
+        force: Boolean = false,
+    ) {
+        threadResumeLock.withLock {
+            selectResumeClient(client)
+            if (!force && sessionId in resumedThreads) return@withLock
+            resumedThreads.remove(sessionId)
+            val result =
+                try {
+                    client.call("thread/resume", buildJsonObject { put("threadId", JsonPrimitive(sessionId)) })
+                } catch (error: CodexJsonRpcClient.RpcError) {
+                    throw IllegalStateException("Codex thread/resume failed (RPC ${error.code}): ${error.message}", error)
+                }
+            val resumedId = result["thread"]?.jsonObject?.string("id")
+            check(resumedId == sessionId) { "Codex thread/resume returned an unexpected thread id" }
+            resumedThreads.add(sessionId)
+        }
+    }
 
     /**
      * Sessions with a turn in flight, each mapped to that turn's own id, so [onServerEnded] knows
@@ -347,9 +385,11 @@ class CodexRuntime(
             buildJsonObject {
                 put("cwd", JsonPrimitive(directory))
             }
-        val result = call("thread/start", params)
+        val client = ensureServer()
+        val result = client.call("thread/start", params)
         val thread = result["thread"]?.jsonObject ?: error("Codex did not return a thread")
         val session = threadToSession(thread)
+        markThreadLoaded(client, session.id)
         val requestedTitle = title?.takeIf(String::isNotBlank)
         if (requestedTitle == null) return session
         // Applied to the returned object directly rather than re-fetching the thread: the rename
@@ -373,7 +413,18 @@ class CodexRuntime(
         )
     }
 
-    fun listMessages(sessionId: String): List<OpenCodeMessage> = messageStore.list(sessionId)
+    suspend fun listMessages(sessionId: String): List<OpenCodeMessage> {
+        // Keep the locally cached transcript visible if resume fails. The next send retries
+        // the resume and exposes the RPC error to the chat rather than losing the transcript.
+        try {
+            ensureThreadLoaded(ensureServer(), sessionId)
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            android.util.Log.w("CodexRuntime", "Thread resume on history load failed", error)
+        }
+        return messageStore.list(sessionId)
+    }
 
     suspend fun deleteSession(sessionId: String): Boolean =
         runCatching {
@@ -407,8 +458,22 @@ class CodexRuntime(
         attachments: List<PromptAttachment> = emptyList(),
     ) {
         val params = codexTurnStartParams(sessionId, prompt, model, effort, serviceTier, attachments)
-        runCatching { call("turn/start", params) }
-            .onSuccess { result ->
+        runCatching {
+            val client = ensureServer()
+            ensureThreadLoaded(client, sessionId)
+            try {
+                client.call("turn/start", params)
+            } catch (error: CodexJsonRpcClient.RpcError) {
+                // Retry only an explicit missing-thread rejection, never a transport failure.
+                if (error.message?.contains("thread not found", ignoreCase = true) != true) throw error
+                ensureThreadLoaded(client, sessionId, force = true)
+                try {
+                    client.call("turn/start", params)
+                } catch (retryError: CodexJsonRpcClient.RpcError) {
+                    throw IllegalStateException("Codex turn/start after resume failed (RPC ${retryError.code}): ${retryError.message}", retryError)
+                }
+            }
+        }.onSuccess { result ->
                 // Recorded by turn id, not just session id, so onServerEnded can evict exactly this
                 // turn's in-progress assistant message from CodexItemParser if the process dies
                 // before turn/completed ever arrives - without the turn id there is nothing to pass
